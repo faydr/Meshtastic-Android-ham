@@ -1,14 +1,19 @@
 package com.geeksville.mesh.ui
 
+import android.annotation.SuppressLint
+import android.app.PendingIntent
 import android.bluetooth.BluetoothDevice
 import android.companion.CompanionDeviceManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.RemoteException
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -22,8 +27,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.fragment.app.activityViewModels
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.asLiveData
-import androidx.lifecycle.flowWithLifecycle
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import com.geeksville.mesh.analytics.DataPair
 import com.geeksville.mesh.android.GeeksvilleApplication
 import com.geeksville.mesh.android.Logging
@@ -43,25 +48,17 @@ import com.geeksville.mesh.repository.radio.MockInterface
 import com.geeksville.mesh.repository.usb.UsbRepository
 import com.geeksville.mesh.service.MeshService
 import com.geeksville.mesh.service.SoftwareUpdateService
+import com.geeksville.mesh.util.PendingIntentCompat
+import com.geeksville.mesh.util.anonymize
+import com.geeksville.mesh.util.exceptionReporter
 import com.geeksville.mesh.util.exceptionToSnackbar
+import com.geeksville.mesh.util.getParcelableExtraCompat
 import com.geeksville.mesh.util.onEditorAction
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.snackbar.Snackbar
 import dagger.hilt.android.AndroidEntryPoint
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.launch
 import javax.inject.Inject
-
-object SLogging : Logging
-
-/// Change to a new macaddr selection, updating GUI and radio
-fun changeDeviceSelection(context: MainActivity, newAddr: String?) {
-    // FIXME, this is a kinda yucky way to find the service
-    context.model.meshService?.let { service ->
-        MeshService.changeDeviceAddress(context, service, newAddr)
-    }
-}
 
 @AndroidEntryPoint
 class SettingsFragment : ScreenFragment("Settings"), Logging {
@@ -79,9 +76,13 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
 
     @Inject
     internal lateinit var locationRepository: LocationRepository
-    private var receivingLocationUpdates: Job? = null
 
     private val myActivity get() = requireActivity() as MainActivity
+
+    private val hasCompanionDeviceApi by lazy { requireContext().hasCompanionDeviceApi() }
+    private val useCompanionDeviceApi by lazy {
+        android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.S && hasCompanionDeviceApi
+    }
 
     private fun doFirmwareUpdate() {
         model.meshService?.let { service ->
@@ -193,24 +194,22 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
         // We don't want to be notified of our own changes, so turn off listener while making them
         spinner.setSelection(regionIndex, false)
         spinner.onItemSelectedListener = regionSpinnerListener
-        spinner.isEnabled = true
+        spinner.isEnabled = !model.isManaged
 
         // If actively connected possibly let the user update firmware
         refreshUpdateButton(model.isConnected())
 
         // Update the status string (highest priority messages first)
         val info = model.myNodeInfo.value
-        val statusText = binding.scanStatusText
         when (connected) {
-            MeshService.ConnectionState.CONNECTED -> {
-                statusText.text = if (region.number == 0) getString(R.string.must_set_region)
-                else getString(R.string.connected_to).format(info?.firmwareString ?: "unknown")
-            }
-            MeshService.ConnectionState.DISCONNECTED ->
-                statusText.text = getString(R.string.not_connected)
-            MeshService.ConnectionState.DEVICE_SLEEP ->
-                statusText.text = getString(R.string.connected_sleeping)
-            else -> {}
+            MeshService.ConnectionState.CONNECTED ->
+                if (region.number == 0) R.string.must_set_region else R.string.connected_to
+            MeshService.ConnectionState.DISCONNECTED -> R.string.not_connected
+            MeshService.ConnectionState.DEVICE_SLEEP -> R.string.connected_sleeping
+            else -> null
+        }?.let {
+            val firmwareString = info?.firmwareString ?: getString(R.string.unknown)
+            scanModel.setErrorText(getString(it, firmwareString))
         }
     }
 
@@ -248,17 +247,8 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
             ActivityResultContracts.StartIntentSenderForResult()
         ) {
             it.data
-                ?.getParcelableExtra<BluetoothDevice>(CompanionDeviceManager.EXTRA_DEVICE)
-                ?.let { device ->
-                    scanModel.onSelected(
-                        myActivity,
-                        BTScanModel.DeviceListEntry(
-                            device.name,
-                            "x${device.address}",
-                            device.bondState == BluetoothDevice.BOND_BONDED
-                        )
-                    )
-                }
+                ?.getParcelableExtraCompat<BluetoothDevice>(CompanionDeviceManager.EXTRA_DEVICE)
+                ?.let { device -> onSelected(BTScanModel.BLEDeviceListEntry(device)) }
         }
 
         val requestBackgroundAndCheckLauncher =
@@ -275,9 +265,9 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
             registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
                 if (permissions.entries.all { it.value }) {
                     // Older versions of android only need Location permission
-                    if (myActivity.hasBackgroundPermission()) {
+                    if (requireContext().hasBackgroundPermission()) {
                         binding.provideLocationCheckbox.isChecked = true
-                    } else requestBackgroundAndCheckLauncher.launch(myActivity.getBackgroundPermissions())
+                    } else requestBackgroundAndCheckLauncher.launch(requireContext().getBackgroundPermissions())
                 } else {
                     debug("User denied location permission")
                     showSnackbar(getString(R.string.why_background_required))
@@ -291,15 +281,19 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
         regionAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         spinner.adapter = regionAdapter
 
-        model.ownerName.observe(viewLifecycleOwner) { name ->
-            binding.usernameEditText.isEnabled = !name.isNullOrEmpty()
+        model.ourNodeInfo.asLiveData().observe(viewLifecycleOwner) { node ->
+            val name = node?.user?.longName
+            binding.usernameEditText.isEnabled = !name.isNullOrEmpty() && !model.isManaged
             binding.usernameEditText.setText(name)
+        }
+
+        scanModel.devices.observe(viewLifecycleOwner) { devices ->
+            updateDevicesButtons(devices)
         }
 
         // Only let user edit their name or set software update while connected to a radio
         model.connectionState.observe(viewLifecycleOwner) {
             updateNodeInfo()
-            updateDevicesButtons(scanModel.devices.value)
         }
 
         model.localConfig.asLiveData().observe(viewLifecycleOwner) {
@@ -307,7 +301,7 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
                 val configCount = it.allFields.size
                 val configTotal = ConfigProtos.Config.getDescriptor().fields.size
                 if (configCount > 0)
-                    binding.scanStatusText.text = "Device config ($configCount / $configTotal)"
+                    scanModel.setErrorText("Device config ($configCount / $configTotal)")
             } else updateNodeInfo()
         }
 
@@ -316,7 +310,7 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
                 val moduleCount = it.allFields.size
                 val moduleTotal = ModuleConfigProtos.ModuleConfig.getDescriptor().fields.size
                 if (moduleCount > 0)
-                    binding.scanStatusText.text = "Module config ($moduleCount / $moduleTotal)"
+                    scanModel.setErrorText("Module config ($moduleCount / $moduleTotal)")
             } else updateNodeInfo()
         }
 
@@ -324,17 +318,13 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
             if (!model.isConnected()) it.protobuf.let { ch ->
                 val maxChannels = model.myNodeInfo.value?.maxChannels ?: "8"
                 if (!ch.hasLoraConfig() && ch.settingsCount > 0)
-                    binding.scanStatusText.text = "Channels (${ch.settingsCount} / $maxChannels)"
+                    scanModel.setErrorText("Channels (${ch.settingsCount} / $maxChannels)")
             }
         }
 
         // Also watch myNodeInfo because it might change later
         model.myNodeInfo.observe(viewLifecycleOwner) {
             updateNodeInfo()
-        }
-
-        scanModel.devices.observe(viewLifecycleOwner) { devices ->
-            updateDevicesButtons(devices)
         }
 
         scanModel.errorText.observe(viewLifecycleOwner) { errMsg ->
@@ -372,21 +362,23 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
             val n = binding.usernameEditText.text.toString().trim()
             model.ourNodeInfo.value?.user?.let {
                 val user = it.copy(longName = n, shortName = getInitials(n))
-                if (n.isNotEmpty()) model.setOwner(user)
+                if (n.isNotEmpty()) model.setOwner(user.toProto())
             }
             requireActivity().hideKeyboard()
         }
 
         // Observe receivingLocationUpdates state and update provideLocationCheckbox
-        if (receivingLocationUpdates?.isActive == true) return
-        else receivingLocationUpdates = locationRepository.receivingLocationUpdates
-            .flowWithLifecycle(lifecycle, Lifecycle.State.STARTED)
-            .onEach { binding.provideLocationCheckbox.isChecked = it }
-            .launchIn(lifecycleScope)
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                locationRepository.receivingLocationUpdates.collect {
+                    binding.provideLocationCheckbox.isChecked = it
+                }
+            }
+        }
 
         binding.provideLocationCheckbox.setOnCheckedChangeListener { view, isChecked ->
             // Don't check the box until the system setting changes
-            view.isChecked = isChecked && myActivity.hasBackgroundPermission()
+            view.isChecked = isChecked && requireContext().hasBackgroundPermission()
 
             if (view.isPressed) { // We want to ignore changes caused by code (as opposed to the user)
                 debug("User changed location tracking to $isChecked")
@@ -400,10 +392,10 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
                         }
                         .setPositiveButton(getString(R.string.accept)) { _, _ ->
                             // Make sure we have location permission (prerequisite)
-                            if (!myActivity.hasLocationPermission()) {
-                                requestLocationAndBackgroundLauncher.launch(myActivity.getLocationPermissions())
+                            if (!requireContext().hasLocationPermission()) {
+                                requestLocationAndBackgroundLauncher.launch(requireContext().getLocationPermissions())
                             } else {
-                                requestBackgroundAndCheckLauncher.launch(myActivity.getBackgroundPermissions())
+                                requestBackgroundAndCheckLauncher.launch(requireContext().getBackgroundPermissions())
                             }
                         }
                         .show()
@@ -459,8 +451,7 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
             if (!device.bonded) // If user just clicked on us, try to bond
                 binding.scanStatusText.setText(R.string.starting_pairing)
 
-            b.isChecked =
-                scanModel.onSelected(myActivity, device)
+            b.isChecked = onSelected(device)
         }
     }
 
@@ -496,10 +487,9 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
 
         if (curRadio != null && !MockInterface.addressValid(requireContext(), usbRepository, "")) {
             binding.warningNotPaired.visibility = View.GONE
-            // binding.scanStatusText.text = getString(R.string.current_pair).format(curRadio)
-        } else if (bluetoothViewModel.enabled.value == true){
+        } else if (bluetoothViewModel.enabled.value == true) {
             binding.warningNotPaired.visibility = View.VISIBLE
-            binding.scanStatusText.text = getString(R.string.not_paired_yet)
+            scanModel.setErrorText(getString(R.string.not_paired_yet))
         }
     }
 
@@ -513,10 +503,132 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
                 scanModel.stopScan()
             }, SCAN_PERIOD)
             scanning = true
-            scanModel.startScan()
+            scanModel.startScan(requireActivity().takeIf { useCompanionDeviceApi })
         } else {
             scanning = false
             scanModel.stopScan()
+        }
+    }
+
+    private fun changeDeviceAddress(address: String) {
+        try {
+            model.meshService?.let { service ->
+                MeshService.changeDeviceAddress(requireActivity(), service, address)
+            }
+            scanModel.changeSelectedAddress(address) // if it throws the change will be discarded
+        } catch (ex: RemoteException) {
+            errormsg("changeDeviceSelection failed, probably it is shutting down $ex.message")
+            // ignore the failure and the GUI won't be updating anyways
+        }
+    }
+
+    /// Called by the GUI when a new device has been selected by the user
+    /// Returns true if we were able to change to that item
+    private fun onSelected(it: BTScanModel.DeviceListEntry): Boolean {
+        // If the device is paired, let user select it, otherwise start the pairing flow
+        if (it.bonded) {
+            changeDeviceAddress(it.fullAddress)
+            return true
+        } else {
+            // Handle requesting USB or bluetooth permissions for the device
+            debug("Requesting permissions for the device")
+
+            exceptionReporter {
+                if (it.isBLE) {
+                    // Request bonding for bluetooth
+                    // We ignore missing BT adapters, because it lets us run on the emulator
+                    scanModel.getRemoteDevice(it.address)?.let { device ->
+                        requestBonding(device) { state ->
+                            if (state == BluetoothDevice.BOND_BONDED) {
+                                scanModel.setErrorText(getString(R.string.pairing_completed))
+                                changeDeviceAddress(it.fullAddress)
+                            } else {
+                                scanModel.setErrorText(getString(R.string.pairing_failed_try_again))
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (it.isUSB) {
+                it as BTScanModel.USBDeviceListEntry
+
+                val usbReceiver = object : BroadcastReceiver() {
+
+                    override fun onReceive(context: Context, intent: Intent) {
+                        if (BTScanModel.ACTION_USB_PERMISSION == intent.action) {
+
+                            val device: UsbDevice? =
+                                intent.getParcelableExtraCompat(UsbManager.EXTRA_DEVICE)
+                            val deviceName: String = device?.deviceName ?: "unknown"
+
+                            if (intent.getBooleanExtra(
+                                    UsbManager.EXTRA_PERMISSION_GRANTED,
+                                    false
+                                )
+                            ) {
+                                info("User approved USB access")
+                                changeDeviceAddress(it.fullAddress)
+                            } else {
+                                errormsg("USB permission denied for device $deviceName")
+                            }
+                        }
+                        // We don't need to stay registered
+                        requireActivity().unregisterReceiver(this)
+                    }
+                }
+
+                val permissionIntent = PendingIntent.getBroadcast(
+                    activity,
+                    0,
+                    Intent(BTScanModel.ACTION_USB_PERMISSION),
+                    PendingIntentCompat.FLAG_IMMUTABLE
+                )
+                val filter = IntentFilter(BTScanModel.ACTION_USB_PERMISSION)
+                requireActivity().registerReceiver(usbReceiver, filter)
+                requireContext().usbManager.requestPermission(it.usb.device, permissionIntent)
+            }
+
+            return false
+        }
+    }
+
+    /// Show the UI asking the user to bond with a device, call changeSelection() if/when bonding completes
+    @SuppressLint("MissingPermission")
+    private fun requestBonding(
+        device: BluetoothDevice,
+        onComplete: (Int) -> Unit
+    ) {
+        info("Starting bonding for ${device.anonymize}")
+
+        // We need this receiver to get informed when the bond attempt finished
+        val bondChangedReceiver = object : BroadcastReceiver() {
+
+            override fun onReceive(
+                context: Context,
+                intent: Intent
+            ) = exceptionReporter {
+                val state =
+                    intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, -1)
+                debug("Received bond state changed $state")
+
+                if (state != BluetoothDevice.BOND_BONDING) {
+                    context.unregisterReceiver(this) // we stay registered until bonding completes (either with BONDED or NONE)
+                    debug("Bonding completed, state=$state")
+                    onComplete(state)
+                }
+            }
+        }
+
+        val filter = IntentFilter()
+        filter.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+        requireActivity().registerReceiver(bondChangedReceiver, filter)
+
+        // We ignore missing BT adapters, because it lets us run on the emulator
+        try {
+            device.createBond()
+        } catch (ex: Throwable) {
+            warn("Failed creating Bluetooth bond: ${ex.message}")
         }
     }
 
@@ -529,7 +641,7 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
             registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
                 if (permissions.entries.all { it.value }) {
                     checkBTEnabled()
-                    if (!scanModel.hasCompanionDeviceApi) checkLocationEnabled()
+                    if (!hasCompanionDeviceApi) checkLocationEnabled()
                     scanLeDevice()
                 } else {
                     errormsg("User denied scan permissions")
@@ -541,9 +653,9 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
         binding.changeRadioButton.setOnClickListener {
             debug("User clicked changeRadioButton")
             scanLeDevice()
-            if (scanModel.hasBluetoothPermission) {
+            if (requireContext().hasBluetoothPermission()) {
                 checkBTEnabled()
-                if (!scanModel.hasCompanionDeviceApi) checkLocationEnabled()
+                if (!hasCompanionDeviceApi) checkLocationEnabled()
             } else {
                 MaterialAlertDialogBuilder(requireContext())
                     .setTitle(getString(R.string.required_permissions))
@@ -553,7 +665,7 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
                     }
                     .setPositiveButton(R.string.accept) { _, _ ->
                         info("requesting scan permissions")
-                        requestPermissionAndScanLauncher.launch(myActivity.getBluetoothPermissions())
+                        requestPermissionAndScanLauncher.launch(requireContext().getBluetoothPermissions())
                     }
                     .show()
             }
@@ -608,10 +720,8 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
     override fun onResume() {
         super.onResume()
 
-        scanModel.setupScan()
-
         // system permissions might have changed while we were away
-        binding.provideLocationCheckbox.isChecked = myActivity.hasBackgroundPermission() && (model.provideLocation.value ?: false)
+        binding.provideLocationCheckbox.isChecked = requireContext().hasBackgroundPermission() && (model.provideLocation.value ?: false)
 
         myActivity.registerReceiver(updateProgressReceiver, updateProgressFilter)
 
@@ -622,6 +732,12 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
         if (binding.provideLocationCheckbox.isChecked)
             checkLocationEnabled(getString(R.string.location_disabled))
     }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+
     companion object {
         const val SCAN_PERIOD: Long = 10000 // Stops scanning after 10 seconds
     }

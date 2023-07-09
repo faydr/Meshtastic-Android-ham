@@ -32,19 +32,20 @@ import androidx.viewpager2.adapter.FragmentStateAdapter
 import com.geeksville.mesh.android.*
 import com.geeksville.mesh.concurrent.handledLaunch
 import com.geeksville.mesh.databinding.ActivityMainBinding
-import com.geeksville.mesh.model.BTScanModel
 import com.geeksville.mesh.model.BluetoothViewModel
 import com.geeksville.mesh.model.ChannelSet
 import com.geeksville.mesh.model.DeviceVersion
 import com.geeksville.mesh.model.UIViewModel
 import com.geeksville.mesh.repository.radio.BluetoothInterface
-import com.geeksville.mesh.repository.radio.RadioInterfaceService
 import com.geeksville.mesh.repository.radio.SerialInterface
 import com.geeksville.mesh.service.*
 import com.geeksville.mesh.ui.*
+import com.geeksville.mesh.ui.map.MapFragment
 import com.geeksville.mesh.util.Exceptions
+import com.geeksville.mesh.util.getParcelableExtraCompat
 import com.geeksville.mesh.util.LanguageUtils
 import com.geeksville.mesh.util.exceptionReporter
+import com.geeksville.mesh.util.getPackageInfoCompat
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.snackbar.Snackbar
 import com.google.android.material.tabs.TabLayoutMediator
@@ -55,7 +56,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import java.text.DateFormat
 import java.util.Date
-import javax.inject.Inject
 
 /*
 UI design
@@ -115,11 +115,7 @@ class MainActivity : AppCompatActivity(), Logging {
     private val mainScope = CoroutineScope(Dispatchers.Main + Job())
 
     private val bluetoothViewModel: BluetoothViewModel by viewModels()
-    private val scanModel: BTScanModel by viewModels()
-    val model: UIViewModel by viewModels()
-
-    @Inject
-    internal lateinit var radioInterfaceService: RadioInterfaceService
+    private val model: UIViewModel by viewModels()
 
     private val requestPermissionsLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
@@ -210,10 +206,6 @@ class MainActivity : AppCompatActivity(), Logging {
             tab.icon = ContextCompat.getDrawable(this, tabInfos[position].icon)
         }.attach()
 
-        model.connectionState.observe(this) { connected ->
-            updateConnectionStatusImage(connected)
-        }
-
         // Handle any intent
         handleIntent(intent)
     }
@@ -275,7 +267,7 @@ class MainActivity : AppCompatActivity(), Logging {
             }
 
             UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
-                val device: UsbDevice? = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+                val device: UsbDevice? = intent.getParcelableExtraCompat(UsbManager.EXTRA_DEVICE)
                 if (device != null) {
                     debug("Handle USB device attached! $device")
                     usbDevice = device
@@ -486,12 +478,11 @@ class MainActivity : AppCompatActivity(), Logging {
 
                 when (intent.action) {
                     MeshService.ACTION_NODE_CHANGE -> {
-                        val info: NodeInfo =
-                            intent.getParcelableExtra(EXTRA_NODEINFO)!!
+                        val info: NodeInfo? = intent.getParcelableExtraCompat(EXTRA_NODEINFO)
                         debug("UI nodechange $info")
 
                         // We only care about nodes that have user info
-                        info.user?.id?.let {
+                        info?.user?.id?.let {
                             val nodes = model.nodeDB.nodes.value!! + Pair(it, info)
                             model.nodeDB.setNodes(nodes)
                         }
@@ -638,14 +629,22 @@ class MainActivity : AppCompatActivity(), Logging {
         unregisterMeshReceiver() // No point in receiving updates while the GUI is gone, we'll get them when the user launches the activity
         unbindMeshService()
 
+        model.connectionState.removeObservers(this)
+        bluetoothViewModel.enabled.removeObservers(this)
+        model.requestChannelUrl.removeObservers(this)
+
         super.onStop()
     }
 
     override fun onStart() {
         super.onStart()
 
+        model.connectionState.observe(this) { connected ->
+            updateConnectionStatusImage(connected)
+        }
+
         bluetoothViewModel.enabled.observe(this) { enabled ->
-            if (!enabled && !requestedEnable && scanModel.selectedBluetooth) {
+            if (!enabled && !requestedEnable && model.selectedBluetooth) {
                 requestedEnable = true
                 if (hasBluetoothPermission()) {
                     val enableBtIntent = Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)
@@ -682,7 +681,7 @@ class MainActivity : AppCompatActivity(), Logging {
             errormsg("Bind of MeshService failed")
         }
 
-        val bonded = radioInterfaceService.getBondedDeviceAddress() != null
+        val bonded = model.bondedAddress != null
         if (!bonded && usbDevice == null) // we will handle USB later
             showSettingsPage()
     }
@@ -701,13 +700,14 @@ class MainActivity : AppCompatActivity(), Logging {
         return true
     }
 
-    val handler: Handler by lazy {
+    private val handler: Handler by lazy {
         Handler(Looper.getMainLooper())
     }
 
     override fun onPrepareOptionsMenu(menu: Menu): Boolean {
         menu.findItem(R.id.stress_test).isVisible =
             BuildConfig.DEBUG // only show stress test for debug builds (for now)
+        menu.findItem(R.id.radio_config).isEnabled = !model.isManaged
         return super.onPrepareOptionsMenu(menu)
     }
 
@@ -749,16 +749,10 @@ class MainActivity : AppCompatActivity(), Logging {
                     handler.removeCallbacksAndMessages(null)
                 return true
             }
-            R.id.device_settings -> {
+            R.id.radio_config -> {
+                val node = model.ourNodeInfo.value ?: return true
                 supportFragmentManager.beginTransaction()
-                    .add(R.id.mainActivityLayout, DeviceSettingsFragment())
-                    .addToBackStack(null)
-                    .commit()
-                return true
-            }
-            R.id.module_settings -> {
-                supportFragmentManager.beginTransaction()
-                    .add(R.id.mainActivityLayout, ModuleSettingsFragment())
+                    .add(R.id.mainActivityLayout, DeviceSettingsFragment(node))
                     .addToBackStack(null)
                     .commit()
                 return true
@@ -799,7 +793,7 @@ class MainActivity : AppCompatActivity(), Logging {
 
     private fun getVersionInfo() {
         try {
-            val packageInfo: PackageInfo = packageManager.getPackageInfo(packageName, 0)
+            val packageInfo: PackageInfo = packageManager.getPackageInfoCompat(packageName, 0)
             val versionName = packageInfo.versionName
             Toast.makeText(this, versionName, Toast.LENGTH_LONG).show()
         } catch (e: PackageManager.NameNotFoundException) {

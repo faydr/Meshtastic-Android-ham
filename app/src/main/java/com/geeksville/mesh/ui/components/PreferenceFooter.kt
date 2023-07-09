@@ -6,7 +6,6 @@ import androidx.compose.material.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -41,35 +40,39 @@ fun PreferenceFooter(
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .size(48.dp),
+            .height(64.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Button(
             modifier = modifier
                 .fillMaxWidth()
+                .height(48.dp)
                 .weight(1f),
             enabled = enabled,
             onClick = onNegativeClicked,
-            colors = ButtonDefaults.buttonColors(backgroundColor = Color.Red)
+            colors = ButtonDefaults.buttonColors(
+                disabledContentColor = MaterialTheme.colors.onSurface.copy(alpha = ContentAlpha.disabled)
+            )
         ) {
             Text(
                 text = stringResource(id = negativeText),
                 style = MaterialTheme.typography.body1,
-                color = if (!enabled) MaterialTheme.colors.onSurface.copy(alpha = ContentAlpha.disabled) else Color.Unspecified,
             )
         }
         Button(
             modifier = modifier
                 .fillMaxWidth()
+                .height(48.dp)
                 .weight(1f),
             enabled = enabled,
             onClick = onPositiveClicked,
-            colors = ButtonDefaults.buttonColors(backgroundColor = Color.Green)
+            colors = ButtonDefaults.buttonColors(
+                disabledContentColor = MaterialTheme.colors.onSurface.copy(alpha = ContentAlpha.disabled)
+            )
         ) {
             Text(
                 text = stringResource(id = positiveText),
                 style = MaterialTheme.typography.body1,
-                color = if (!enabled) MaterialTheme.colors.onSurface.copy(alpha = ContentAlpha.disabled) else Color.DarkGray,
             )
         }
     }

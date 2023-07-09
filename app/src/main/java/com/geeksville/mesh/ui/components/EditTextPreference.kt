@@ -19,6 +19,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusState
 import androidx.compose.ui.focus.onFocusEvent
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
@@ -33,6 +34,7 @@ fun EditTextPreference(
     keyboardActions: KeyboardActions,
     onValueChanged: (Int) -> Unit,
     modifier: Modifier = Modifier,
+    trailingIcon: (@Composable () -> Unit)? = null,
 ) {
     var valueState by remember(value) { mutableStateOf(value.toUInt().toString()) }
 
@@ -52,7 +54,9 @@ fun EditTextPreference(
                 onValueChanged(int)
             }
         },
-        modifier = modifier
+        onFocusChanged = {},
+        modifier = modifier,
+        trailingIcon = trailingIcon
     )
 }
 
@@ -83,6 +87,7 @@ fun EditTextPreference(
                 onValueChanged(float)
             }
         },
+        onFocusChanged = {},
         modifier = modifier
     )
 }
@@ -97,6 +102,7 @@ fun EditTextPreference(
     modifier: Modifier = Modifier,
 ) {
     var valueState by remember(value) { mutableStateOf(value.toString()) }
+    val decimalSeparators = setOf('.', ',', '٫', '、', '·') // set of possible decimal separators
 
     EditTextPreference(
         title = title,
@@ -108,12 +114,13 @@ fun EditTextPreference(
         ),
         keyboardActions = keyboardActions,
         onValueChanged = {
-            if (it.isEmpty()) valueState = it
+            if (it.length <= 1 || it.first() in decimalSeparators) valueState = it
             else it.toDoubleOrNull()?.let { double ->
                 valueState = it
                 onValueChanged(double)
             }
         },
+        onFocusChanged = {},
         modifier = modifier
     )
 }
@@ -127,16 +134,18 @@ fun EditIPv4Preference(
     onValueChanged: (Int) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val pattern = """\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b""".toRegex()
+
     fun convertIntToIpAddress(int: Int): String {
-        return "${int shr 24 and 0xff}.${int shr 16 and 0xff}.${int shr 8 and 0xff}.${int and 0xff}"
+        return "${int and 0xff}.${int shr 8 and 0xff}.${int shr 16 and 0xff}.${int shr 24 and 0xff}"
     }
-    fun convertIpAddressToInt(ipAddress: String): Int? {
-        return ipAddress.split(".")
-            .map { it.toIntOrNull() }
-            .fold(0) { total, next ->
-                if (next == null) return null else total shl 8 or next
-            }
-    }
+
+    fun convertIpAddressToInt(ipAddress: String): Int? = ipAddress.split(".")
+        .map { it.toIntOrNull() }.reversed() // little-endian byte order
+        .fold(0) { total, next ->
+            if (next == null) return null else total shl 8 or next
+        }
+
     var valueState by remember(value) { mutableStateOf(convertIntToIpAddress(value)) }
 
     EditTextPreference(
@@ -149,14 +158,10 @@ fun EditIPv4Preference(
         ),
         keyboardActions = keyboardActions,
         onValueChanged = {
-            val pattern = """\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b""".toRegex()
-            val isValid = pattern.matches(it)
-            if (it.isEmpty() || !isValid) valueState = it
-            else convertIpAddressToInt(it)?.let { int ->
-                valueState = it
-                onValueChanged(int)
-            }
+            valueState = it
+            if (pattern.matches(it)) convertIpAddressToInt(it)?.let { int -> onValueChanged(int) }
         },
+        onFocusChanged = {},
         modifier = modifier
     )
 }
@@ -172,6 +177,8 @@ fun EditTextPreference(
     onValueChanged: (String) -> Unit,
     modifier: Modifier = Modifier,
     maxSize: Int = 0, // max_size - 1 (in bytes)
+    onFocusChanged: (FocusState) -> Unit = {},
+    trailingIcon: (@Composable () -> Unit)? = null,
 ) {
     var isFocused by remember { mutableStateOf(false) }
 
@@ -180,7 +187,7 @@ fun EditTextPreference(
         singleLine = true,
         modifier = modifier
             .fillMaxWidth()
-            .onFocusEvent { isFocused = it.isFocused },
+            .onFocusEvent { isFocused = it.isFocused; onFocusChanged(it) },
         enabled = enabled,
         isError = isError,
         onValueChange = {
@@ -194,7 +201,11 @@ fun EditTextPreference(
         keyboardOptions = keyboardOptions,
         keyboardActions = keyboardActions,
         trailingIcon = {
-            if (isError) Icon(Icons.TwoTone.Info, "Error", tint = MaterialTheme.colors.error)
+            if (trailingIcon != null) {
+                trailingIcon()
+            } else {
+                if (isError) Icon(Icons.TwoTone.Info, "Error", tint = MaterialTheme.colors.error)
+            }
         }
     )
 
@@ -236,7 +247,7 @@ private fun EditTextPreferencePreview() {
         )
         EditIPv4Preference(
             title = "IP Address",
-            value = 3232235521.toInt(),
+            value = 16820416,
             enabled = true,
             keyboardActions = KeyboardActions {},
             onValueChanged = {}

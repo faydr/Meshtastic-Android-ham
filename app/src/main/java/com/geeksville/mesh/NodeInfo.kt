@@ -1,6 +1,8 @@
 package com.geeksville.mesh
 
+import android.graphics.Color
 import android.os.Parcelable
+import com.geeksville.mesh.MeshProtos.User
 import com.geeksville.mesh.util.bearing
 import com.geeksville.mesh.util.latLongToMeter
 import com.geeksville.mesh.util.anonymize
@@ -25,6 +27,9 @@ data class MeshUser(
     override fun toString(): String {
         return "MeshUser(id=${id.anonymize}, longName=${longName.anonymize}, shortName=${shortName.anonymize}, hwModel=${hwModelString}, isLicensed=${isLicensed})"
     }
+
+    fun toProto(): User = User.newBuilder().setId(id).setLongName(longName).setShortName(shortName)
+        .setHwModel(hwModel).setIsLicensed(isLicensed).build()
 
     /** a string version of the hardware model, converted into pretty lowercase and changing _ to -, and p to dot
      * or null if unset
@@ -153,6 +158,15 @@ data class NodeInfo(
     var environmentMetrics: EnvironmentMetrics? = null,
 ) : Parcelable {
 
+    val colors: Pair<Int, Int>
+        get() { // returns foreground and background @ColorInt for each 'num'
+            val r = (num and 0xFF0000) shr 16
+            val g = (num and 0x00FF00) shr 8
+            val b = num and 0x0000FF
+            val brightness = ((r * 0.299) + (g * 0.587) + (b * 0.114)) / 255
+            return Pair(if (brightness > 0.5) Color.BLACK else Color.WHITE, Color.rgb(r, g, b))
+        }
+
     val batteryLevel get() = deviceMetrics?.batteryLevel
     val voltage get() = deviceMetrics?.voltage
     val batteryStr get() = if (batteryLevel in 1..100) String.format("%d%%", batteryLevel) else ""
@@ -204,11 +218,14 @@ data class NodeInfo(
     }
 
     /// @return a nice human readable string for the distance, or null for unknown
-    fun distanceStr(o: NodeInfo?) = distance(o)?.let { dist ->
+    fun distanceStr(o: NodeInfo?, prefUnits: Int = 0) = distance(o)?.let { dist ->
         when {
             dist == 0 -> null // same point
-            dist < 1000 -> "%.0f m".format(dist.toDouble())
-            else -> "%.1f km".format(dist / 1000.0)
+            prefUnits == ConfigProtos.Config.DisplayConfig.DisplayUnits.METRIC_VALUE && dist < 1000 -> "%.0f m".format(dist.toDouble())
+            prefUnits == ConfigProtos.Config.DisplayConfig.DisplayUnits.METRIC_VALUE && dist >= 1000 -> "%.1f km".format(dist / 1000.0)
+            prefUnits == ConfigProtos.Config.DisplayConfig.DisplayUnits.IMPERIAL_VALUE && dist < 1609 -> "%.0f ft".format(dist.toDouble()*3.281)
+            prefUnits == ConfigProtos.Config.DisplayConfig.DisplayUnits.IMPERIAL_VALUE && dist >= 1609 -> "%.1f mi".format(dist / 1609.34)
+            else -> null
         }
     }
 }
